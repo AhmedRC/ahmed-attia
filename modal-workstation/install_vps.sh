@@ -10,7 +10,7 @@ SKILL_DST="$HERMES_HOME/skills/engineering/modal-workstation"
 
 echo "==> Installing to $PREFIX"
 mkdir -p "$PREFIX" "$HOME/.local/bin"
-rsync -a --delete --exclude '.venv' "$SRC/" "$PREFIX/app/" 2>/dev/null || {
+rsync -a --delete --exclude '.venv' --exclude '.git' --exclude '__pycache__' "$SRC/" "$PREFIX/app/" 2>/dev/null || {
   rm -rf "$PREFIX/app"; cp -r "$SRC" "$PREFIX/app"; }
 
 if command -v uv >/dev/null 2>&1; then

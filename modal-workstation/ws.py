@@ -64,23 +64,32 @@ APT_PACKAGES = [
     "xfce4-xkb-plugin", "thunar", "thunar-archive-plugin", "mousepad",
     "ristretto", "elementary-xfce-icon-theme", "adwaita-icon-theme",
     "dbus-x11", "at-spi2-core", "x11-xserver-utils", "x11-utils", "xdotool",
-    "tigervnc-standalone-server", "tigervnc-tools", "novnc", "websockify",
-    "libgl1-mesa-dri", "libglu1-mesa", "mesa-utils",
+    "xfonts-base", "tigervnc-standalone-server", "tigervnc-tools", "novnc", "websockify",
+    "libgl1-mesa-dri", "libglu1-mesa", "libegl1", "libopengl0", "mesa-utils",
+    # --- Qt / XCB / X11 runtime libs needed by FreeCAD, ParaView & Gmsh ---
+    "libxcb-cursor0", "libxcb-icccm4", "libxcb-image0", "libxcb-keysyms1",
+    "libxcb-randr0", "libxcb-render-util0", "libxcb-shape0", "libxcb-xinerama0",
+    "libxcb-xkb1", "libxkbcommon-x11-0", "libxcursor1", "libxft2", "libxinerama1", "libgomp1",
     # --- fonts (incl. Arabic) + locale ---
     "fonts-dejavu", "fonts-noto-core", "fonts-kacst", "fonts-arabeyes", "locales",
     # --- utilities ---
     "ca-certificates", "curl", "wget", "git", "nano", "htop", "procps",
-    "unzip", "p7zip-full", "file-roller", "gnupg", "less", "tzdata",
-    # --- structural engineering stack ---
-    "freecad", "librecad", "gmsh", "paraview", "calculix-ccx", "calculix-cgx",
+    "unzip", "p7zip-full", "file-roller", "gnupg", "less", "tzdata", "coreutils",
+    # --- structural engineering stack (FreeCAD 1.1 is installed below from official release) ---
+    "librecad", "gmsh", "paraview", "calculix-ccx", "calculix-cgx",
     "openmpi-bin", "python3-numpy", "python3-scipy", "python3-matplotlib",
 ]
 
 PIP_PACKAGES = [
     "numpy", "scipy", "pandas", "matplotlib", "openpyxl",
     "openseespy", "PyNiteFEA", "anastruct", "sectionproperties",
-    "gmsh", "meshio", "ezdxf", "ccx2paraview",
+    "gmsh", "meshio", "ezdxf", "ccx2paraview", "ifcopenshell",
 ]
+
+FREECAD_URL = (
+    "https://github.com/FreeCAD/FreeCAD/releases/download/1.1.4/"
+    "FreeCAD_1.1.4-Linux-x86_64-py311.AppImage"
+)
 
 
 def build_image() -> modal.Image:
@@ -100,12 +109,37 @@ def build_image() -> modal.Image:
             "printf 'Package: *\\nPin: origin packages.mozilla.org\\nPin-Priority: 1000\\n'"
             " > /etc/apt/preferences.d/mozilla",
             "apt-get update && apt-get install -y --no-install-recommends firefox",
+            # FreeCAD 1.1.4 (Ubuntu 24.04 dropped freecad from apt; extract AppImage as FUSE is unavailable)
+            f"wget -q '{FREECAD_URL}' -O /tmp/freecad.AppImage"
+            " && chmod +x /tmp/freecad.AppImage"
+            " && cd /opt && /tmp/freecad.AppImage --appimage-extract >/dev/null"
+            " && mv /opt/squashfs-root /opt/freecad && rm -f /tmp/freecad.AppImage",
+            "printf '#!/usr/bin/env bash\\nexport QT_X11_NO_MITSHM=1 QTWEBENGINE_DISABLE_SANDBOX=1"
+            " LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe\\nexec /opt/freecad/AppRun \"$@\"\\n'"
+            " > /usr/local/bin/freecad && chmod +x /usr/local/bin/freecad"
+            " && ln -sf /opt/freecad/usr/bin/freecadcmd /usr/local/bin/freecadcmd",
+            "install -d /usr/share/applications /usr/share/icons/hicolor/scalable/apps"
+            " && cp -f /opt/freecad/org.freecad.FreeCAD.svg"
+            " /usr/share/icons/hicolor/scalable/apps/org.freecad.FreeCAD.svg 2>/dev/null || true",
+            "printf '[Desktop Entry]\\nName=FreeCAD\\nComment=Parametric 3D CAD / BIM / FEM\\n"
+            "Exec=/usr/local/bin/freecad %%F\\nIcon=org.freecad.FreeCAD\\nTerminal=false\\n"
+            "Type=Application\\nCategories=Graphics;Science;Engineering;\\n'"
+            " > /usr/share/applications/org.freecad.FreeCAD.desktop",
             "sed -i 's/# en_US.UTF-8/en_US.UTF-8/; s/# ar_EG.UTF-8/ar_EG.UTF-8/' /etc/locale.gen"
             " && locale-gen",
             "rm -rf /var/lib/apt/lists/*",
         )
         .pip_install(*PIP_PACKAGES)
-        .env({"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"})
+        # Keep the compiled /usr/bin/gmsh GUI ahead of the pip wrapper in /usr/local/bin/gmsh
+        .run_commands("ln -sf /usr/bin/gmsh /usr/local/bin/gmsh")
+        .env({
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "QT_X11_NO_MITSHM": "1",
+            "QTWEBENGINE_DISABLE_SANDBOX": "1",
+            "OMPI_ALLOW_RUN_AS_ROOT": "1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+        })
         .add_local_dir(HERE / "rootfs" / "opt" / "ws", "/opt/ws", copy=True)
         .run_commands("chmod +x /opt/ws/*.sh /opt/ws/*.py")
     )
@@ -280,18 +314,30 @@ JOB_SCRIPT = r"""
 set -o pipefail
 mkdir -p "$(dirname "$WS_LOG")" "$WS_CWD"
 cd "$WS_CWD"
+(
+  while true; do
+    [ -d /run/ws ] && touch /run/ws/keepalive 2>/dev/null || true
+    sync /work 2>/dev/null || true
+    sleep 15
+  done
+) &
+sync_pid=$!
+trap 'kill $sync_pid 2>/dev/null || true; sync /work 2>/dev/null || true' EXIT
 echo "[ws] $(date -Is) start: $WS_CMD  (cwd=$WS_CWD, threads=$OMP_NUM_THREADS)" | tee -a "$WS_LOG"
-bash -lc "$WS_CMD" 2>&1 | tee -a "$WS_LOG"
+sync /work 2>/dev/null || true
+stdbuf -oL -eL bash -lc "$WS_CMD" 2>&1 | tee -a "$WS_LOG"
 rc=$?
 echo "[ws] $(date -Is) exit code: $rc" | tee -a "$WS_LOG"
-sync /work || true
 exit $rc
 """
 
 
 def cmd_run(a) -> None:
     job = a.name or datetime.now().strftime("job-%Y%m%d-%H%M%S")
-    cwd = a.cwd if a.cwd.startswith("/") else f"{WORK_DIR}/{a.cwd}"
+    rel_cwd = a.cwd.lstrip("/")
+    if rel_cwd == "work" or rel_cwd.startswith("work/"):
+        rel_cwd = rel_cwd[5:]
+    cwd = f"{WORK_DIR}/{rel_cwd}" if rel_cwd else WORK_DIR
     log_path = f"{WORK_DIR}/.ws-jobs/{job}.log"
 
     desktop = find_desktop()
